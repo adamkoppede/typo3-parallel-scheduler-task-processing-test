@@ -24,3 +24,20 @@ multiple `vendor/bin/typo3 scheduler:run` console commands in a loop:
 ```shell
 ddev exec reproduction-helper
 ```
+
+## Recovering from broken state
+
+To recover from a broken state that may have been created when aborting
+`vendor/bin/typo3 scheduler:run` processes:
+
+```shell
+ddev typo3 scheduler:run --task 1 --stop
+rm single-execution-guard
+```
+
+## Apply patches
+
+```shell
+# for TYPO3 v11
+patch -p1 -d vendor/typo3/cms-scheduler < bugfix-typo3v11.patch
+```
