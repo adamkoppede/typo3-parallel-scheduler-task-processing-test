@@ -1,0 +1,33 @@
+{
+    "name": "example/typo3-parallel-scheduler-task-processing-test",
+    "type": "typo3-cms-extension",
+    "require": {
+        "php": "~8.3.0",
+        "symfony/console": "^5.4 || ^6.4 || ^7.2",
+        "typo3/cms-core": "^11.5 || ^12.4 || ^13.1",
+        "typo3/cms-scheduler": "^11.5 || ^12.4 || ^13.1"
+    },
+    "require-dev": {
+        "typo3/cms-composer-installers": "^4.0@rc || >=5.0",
+        "helhum/typo3-console": "^8.2",
+        "vimeo/psalm": "^5.0 || ^6.0"
+    },
+    "license": "GPL-2.0-or-later",
+    "config": {
+        "allow-plugins": {
+            "typo3/cms-composer-installers": true,
+            "typo3/class-alias-loader": true
+        },
+        "sort-packages": true
+    },
+    "extra": {
+        "typo3/cms": {
+            "extension-key": "example_typo3_parallel_scheduler_task_processing_test"
+        }
+    },
+    "autoload": {
+        "psr-4": {
+            "Example\\Typo3ParallelSchedulerTaskProcessingTest\\": "Classes/"
+        }
+    }
+}

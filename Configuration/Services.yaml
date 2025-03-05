@@ -1,0 +1,16 @@
+services:
+  _defaults:
+    autowire: true
+    autoconfigure: true
+    public: false
+
+  Example\Typo3ParallelSchedulerTaskProcessingTest\:
+    resource: '../Classes/*'
+
+  Example\Typo3ParallelSchedulerTaskProcessingTest\CreateSchedulerTaskCommand:
+    tags:
+      - name: console.command
+        command: "create-scheduler-command"
+  
+  Example\Typo3ParallelSchedulerTaskProcessingTest\SingleExecutionGuardService:
+    public: true

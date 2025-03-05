@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<psalm xmlns="https://getpsalm.org/schema/config" errorLevel="1" findUnusedBaselineEntry="true" findUnusedCode="true">
+    <projectFiles>
+        <directory name="Classes"/>
+        <file name="ext_localconf.php"/>
+        <ignoreFiles allowMissingFiles="true">
+            <directory name="vendor"/>
+            <directory name="public/typo3/sysext"/>
+            <directory name="public/typo3conf/ext"/>
+        </ignoreFiles>
+    </projectFiles>
+</psalm>
