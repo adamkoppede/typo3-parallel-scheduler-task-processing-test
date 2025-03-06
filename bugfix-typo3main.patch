@@ -1,0 +1,306 @@
+From 781e66aed6b2008d696320e7af1b476fe5f9f615 Mon Sep 17 00:00:00 2001
+From: Adam Koppe <adam.koppe@3m5.de>
+Date: Thu, 6 Mar 2025 12:05:21 +0100
+Subject: [PATCH] [BUGFIX] parallel execution of non-parallel scheduler task
+
+Previously, multiple scheduler invocations may have picked up the same
+non-parallel scheduler task at the same time. This was due to a
+Time-of-Check Time-of-Use style issue in Scheduler::executeTask(): The
+check preventing parallel executions of non-parallel tasks occurred
+long before the execution was registered. If multiple parallel
+Scheduler::executeTask() calls hit that time window, they all continued
+to actually execute the non-parallel task. This issue is fixed by
+checking the task execution id after the allocation. This way the
+database guarantees that only a single process is able to get a certain
+execution id value since it is a zero-based counter.
+
+Removing the toctou window requires fixing another issue in
+SchedulerTaskRepository::{add,remove}ExecutionToTask(): The future
+tx_scheduler_task.serialized_executions field value was built upon some
+past value. If two processes ran one of these methods in parallel with
+such timing that the time window between the SELECT and UPDATE sql
+statements overlapped, only one operation succeeded. This issue is fixed
+by restricting UPDATE to only be applied if the new value was built upon
+the latest serialized_executions value.
+
+This change also adjusts SchedulerTaskrepository::addExecutionToTask()
+to no longer hallucinate a non-existing execution id of 0 if the
+persistence record associated with the task cannot be found in the
+database by requiring that the persistence record exists for the given
+task.
+
+A full reproduction is available online:
+https://github.com/adamkoppede/typo3-parallel-scheduler-task-processing-test
+
+Change-Id: I1264b5c248dd9aa5402383a498d82650932f29e4
+---
+ .../Repository/SchedulerTaskRepository.php    | 103 ++++++++++++------
+ Classes/Scheduler.php  |  93 ++++++++--------
+ 2 files changed, 114 insertions(+), 82 deletions(-)
+
+diff --git a/Classes/Domain/Repository/SchedulerTaskRepository.php b/Classes/Domain/Repository/SchedulerTaskRepository.php
+index 6ed8d03ee3a..e0f934885e7 100644
+--- a/Classes/Domain/Repository/SchedulerTaskRepository.php
++++ b/Classes/Domain/Repository/SchedulerTaskRepository.php
+@@ -452,51 +452,75 @@ class SchedulerTaskRepository
+      * This method adds current execution to the execution list.
+      * It also logs the execution time and mode
+      *
++     * The execution id is guaranteed to start from zero if the task has no
++     * currently running execution at the time of id allocation.
++     *
+      * @return int Execution id
+      */
+     public function addExecutionToTask(AbstractTask $task): int
+     {
+-        $row = $this->findRecordByUid($task->getTaskUid());
++        for (;;) {
++            $row = $this->findRecordByUid($task->getTaskUid());
+ 
+-        $runningExecutions = [];
+-        if ($row && !empty($row['serialized_executions'])) {
+-            $runningExecutions = unserialize($row['serialized_executions']);
++            if ($row === null) {
++                throw new \InvalidArgumentException(
++                    'Given task must have a persistence record associated with it',
++                    1741257045
++                );
++            }
++
++            $previousExecutions = (string)($row['serialized_executions'] ?? '');
++
++            $runningExecutions = $previousExecutions !== ''
++                ? unserialize($previousExecutions)
++                : [];
++
++            // Count the number of existing executions and use that number as a key
++            // (we need to know that number, because it is returned at the end of the method)
++            $numExecutions = count($runningExecutions);
++            $runningExecutions[$numExecutions] = time();
++            $updateCount = GeneralUtility::makeInstance(ConnectionPool::class)
++                ->getConnectionForTable(self::TABLE_NAME)
++                ->update(
++                    self::TABLE_NAME,
++                    [
++                        'serialized_executions' => serialize($runningExecutions),
++                        'lastexecution_time' => time(),
++                        // Define the context in which the script is running
++                        'lastexecution_context' => Environment::isCli() ? 'CLI' : 'BE',
++                    ],
++                    [
++                        'uid' => $task->getTaskUid(),
++                        'serialized_executions' => $previousExecutions,
++                    ],
++                    [
++                        'serialized_executions' => Connection::PARAM_LOB,
++                    ]
++                );
++            assert($updateCount === 0 || $updateCount === 1);
++
++            if ($updateCount === 1) {
++                return $numExecutions;
++            }
+         }
+-        // Count the number of existing executions and use that number as a key
+-        // (we need to know that number, because it is returned at the end of the method)
+-        $numExecutions = count($runningExecutions);
+-        $runningExecutions[$numExecutions] = time();
+-        GeneralUtility::makeInstance(ConnectionPool::class)
+-            ->getConnectionForTable(self::TABLE_NAME)
+-            ->update(
+-                self::TABLE_NAME,
+-                [
+-                    'serialized_executions' => serialize($runningExecutions),
+-                    'lastexecution_time' => time(),
+-                    // Define the context in which the script is running
+-                    'lastexecution_context' => Environment::isCli() ? 'CLI' : 'BE',
+-                ],
+-                [
+-                    'uid' => $task->getTaskUid(),
+-                ],
+-                [
+-                    'serialized_executions' => Connection::PARAM_LOB,
+-                ]
+-            );
+-        return $numExecutions;
+     }
+ 
+     /**
+      * Removes given execution from list
+      *
+      * @param int $executionID Id of the execution to remove.
+-     * @param string|array|null $failureReason Details of an exception to signal a failed execution
++     * @param string|array|null $failureReason Details of an exception to signal a failed execution.
+      */
+     public function removeExecutionOfTask(AbstractTask $task, int $executionID, array|string|null $failureReason = null): void
+     {
+-        $row = $this->findRecordByUid($task->getTaskUid());
+-        if ($row && $row['serialized_executions'] !== '') {
+-            $runningExecutions = unserialize($row['serialized_executions']);
++        for (;;) {
++            $row = $this->findRecordByUid($task->getTaskUid());
++
++            if ($row === null || ($previousExecutions = (string)($row['serialized_executions'] ?? '')) === '') {
++                break;
++            }
++
++            $runningExecutions = unserialize($previousExecutions);
+             // Remove the selected execution
+             unset($runningExecutions[$executionID]);
+             if (!empty($runningExecutions)) {
+@@ -509,21 +533,30 @@ class SchedulerTaskRepository
+                 $failureReason = json_encode($failureReason);
+             }
+             // Save the updated executions list
+-            GeneralUtility::makeInstance(ConnectionPool::class)
++            $fieldUpdates = [
++                'serialized_executions' => $runningExecutionsSerialized,
++            ];
++            if ($failureReason !== null) {
++                $fieldUpdates['lastexecution_failure'] = (string)$failureReason;
++            }
++            $updateCount = GeneralUtility::makeInstance(ConnectionPool::class)
+                 ->getConnectionForTable(self::TABLE_NAME)
+                 ->update(
+                     self::TABLE_NAME,
+-                    [
+-                        'serialized_executions' => $runningExecutionsSerialized,
+-                        'lastexecution_failure' => (string)$failureReason,
+-                    ],
++                    $fieldUpdates,
+                     [
+                         'uid' => $task->getTaskUid(),
++                        'serialized_executions' => $previousExecutions,
+                     ],
+                     [
+                         'serialized_executions' => Connection::PARAM_LOB,
+                     ]
+                 );
++            assert($updateCount === 0 || $updateCount === 1);
++
++            if ($updateCount === 1) {
++                break;
++            }
+         }
+     }
+ 
+diff --git a/Classes/Scheduler.php b/Classes/Scheduler.php
+index eb9245ed54b..2f5abe28596 100644
+--- a/Classes/Scheduler.php
++++ b/Classes/Scheduler.php
+@@ -143,52 +143,57 @@ class Scheduler implements SingletonInterface
+         // Set a scheduler object for the task again,
+         // as it was removed during the save operation
+         $task->setScheduler();
+-        $result = true;
+-        // Task is already running and multiple executions are not allowed
+-        if (!$task->areMultipleExecutionsAllowed() && $this->schedulerTaskRepository->isTaskMarkedAsRunning($task)) {
+-            // Log multiple execution error
++
++        // Reserve an id for the upcoming execution
++        $executionID = $this->schedulerTaskRepository->addExecutionToTask($task);
++        // Make sure we're the only one executing a single-execution-only task
++        if (!$task->areMultipleExecutionsAllowed() && $executionID > 0) {
++            $this->schedulerTaskRepository->removeExecutionOfTask($task, $executionID, null);
+             $this->logger->info('Task is already running and multiple executions are not allowed, skipping! Class: {class}, UID: {uid}', [
+                 'class' => get_class($task),
+                 'uid' => $task->getTaskUid(),
+             ]);
+-            $result = false;
+-        } else {
+-            // Log scheduler invocation
+-            $this->logger->info('Start execution. Class: {class}, UID: {uid}', [
+-                'class' => get_class($task),
+-                'uid' => $task->getTaskUid(),
+-            ]);
+-            // Register execution
+-            $executionID = $this->schedulerTaskRepository->addExecutionToTask($task);
+-            $failureString = '';
+-            $e = null;
+-            try {
+-                // Execute task
+-                $successfullyExecuted = $task->execute();
+-                if (!$successfullyExecuted) {
+-                    throw new FailedExecutionException('Task failed to execute successfully. Class: ' . get_class($task) . ', UID: ' . $task->getTaskUid(), 1250596541);
+-                }
+-            } catch (\Throwable $e) {
+-                // Log failed execution
+-                $this->logger->error('Task failed to execute successfully. Class: {taskClass}, UID: {taskId}, Code: {code}, "{message}" in {exceptionFile} at line {exceptionLine}', [
+-                    'taskClass' => get_class($task),
+-                    'taskId' => $task->getTaskUid(),
+-                    'exception' => $e,
+-                    'exceptionFile' => $e->getFile(),
+-                    'exceptionLine' => $e->getLine(),
+-                    'code' => $e->getCode(),
+-                    'message' => $e->getMessage(),
+-                ]);
+-                // Store exception, so that it can be saved to database
+-                // Do not serialize the complete exception or the trace, this can lead to huge strings > 50MB
+-                $failureString = serialize([
+-                    'code' => $e->getCode(),
+-                    'message' => $e->getMessage(),
+-                    'file' => $e->getFile(),
+-                    'line' => $e->getLine(),
+-                    'traceString' => $e->getTraceAsString(),
+-                ]);
++            return false;
++        }
++
++        // Log scheduler invocation
++        $this->logger->info('Start execution. Class: {class}, UID: {uid}', [
++            'class' => get_class($task),
++            'uid' => $task->getTaskUid(),
++        ]);
++
++        $failureString = '';
++        try {
++            // Execute task
++            $successfullyExecuted = $task->execute();
++            if (!$successfullyExecuted) {
++                throw new FailedExecutionException('Task failed to execute successfully. Class: ' . get_class($task) . ', UID: ' . $task->getTaskUid(), 1250596541);
+             }
++            return true;
++        } catch(\Throwable $e) {
++            // Log failed execution
++            $this->logger->error('Task failed to execute successfully. Class: {taskClass}, UID: {taskId}, Code: {code}, "{message}" in {exceptionFile} at line {exceptionLine}', [
++                'taskClass' => get_class($task),
++                'taskId' => $task->getTaskUid(),
++                'exception' => $e,
++                'exceptionFile' => $e->getFile(),
++                'exceptionLine' => $e->getLine(),
++                'code' => $e->getCode(),
++                'message' => $e->getMessage(),
++            ]);
++            // Store exception, so that it can be saved to database
++            // Do not serialize the complete exception or the trace, this can lead to huge strings > 50MB
++            $failureString = serialize([
++                'code' => $e->getCode(),
++                'message' => $e->getMessage(),
++                'file' => $e->getFile(),
++                'line' => $e->getLine(),
++                'traceString' => $e->getTraceAsString(),
++            ]);
++            // Now that the result of the task execution has been handled,
++            // throw the exception again, if any
++            throw $e;
++        } finally {
+             // Un-register execution
+             $this->schedulerTaskRepository->removeExecutionOfTask($task, $executionID, $failureString);
+             // Log completion of execution
+@@ -196,13 +201,7 @@ class Scheduler implements SingletonInterface
+                 'class' => get_class($task),
+                 'uid' => $task->getTaskUid(),
+             ]);
+-            // Now that the result of the task execution has been handled,
+-            // throw the exception again, if any
+-            if ($e !== null) {
+-                throw $e;
+-            }
+         }
+-        return $result;
+     }
+ 
+     /**
+-- 
+2.43.0
+
