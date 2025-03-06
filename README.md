@@ -38,6 +38,7 @@ rm single-execution-guard
 ## Apply patches
 
 ```shell
+patch -p1 -d vendor/typo3/cms-scheduler < bugfix-typo3main.patch
 # for TYPO3 v11
 patch -p1 -d vendor/typo3/cms-scheduler < bugfix-typo3v11.patch
 ```
