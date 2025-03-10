@@ -16,6 +16,12 @@ ddev typo3 install:setup --force --no-interaction
 ddev typo3 create-scheduler-command
 ```
 
+### Additional Setup for TYPO3 v11
+
+```shell
+cp config/system/additional.php public/typo3conf/AdditionalConfiguration.php
+```
+
 ## Reproduction
 
 There is a helper program in the ddev webserver service container that bursts

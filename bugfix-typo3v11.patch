@@ -1,108 +1,136 @@
-From cbc8df2209ae613717d3633e0dacc77358056af7 Mon Sep 17 00:00:00 2001
+From 66ce1ee77f4abaca11730f1dde6d63afe392e77a Mon Sep 17 00:00:00 2001
 From: Adam Koppe <adam.koppe@3m5.de>
 Date: Wed, 5 Mar 2025 21:08:58 +0100
-Subject: [PATCH] [BUGFIX] parallel execution of non-parallel scheduler task
+Subject: [PATCH] [BUGFIX] Parallel execution of non-parallel scheduler task
 
-Previously, multiple scheduler invocations may have picked up the same
-non-parallel scheduler task at the same time. This was due to a
-Time-of-Check Time-of-Use style issue in Scheduler::executeTask():
-the check preventing parallel executions of non-parallel tasks occurred
-long before the execution was registered. If multiple parallel
-Scheduler::executeTask() calls hit that time window, they all continued
-to actually execute the non-parallel task. This issue is fixed by
-checking the task execution id after the reservation, since that one is
-a guaranteed zero-based task execution counter.
+Close a Time-of-Check Time-of-Use style time window in
+Scheduler::executeTask() by checking the actual task execution id value
+after the allocation instead of checking for any task execution id
+allocations long before the actual execution id allocation happens. The
+time window allowed multiple scheduler invocations to pick up and
+execute the same non-parallel scheduler task at the same time.
 
-Removing the toctou window requires fixing another issue in
-AbstractTask::markExecution() and AbstractTask::unmarkExecution(): The
-future serialized_executions task field value was built upon some past
-serialized_executions value. If two processes ran one of these methods
-in parallel with such timing that the time window between the SELECT and
-UPDATE sql statements overlapped, only one operation succeeded. This
-issue is fixed by restricting UPDATE to only be applied if the new value
-was built upon the latest serialized_executions value.
+Make AbstractTask::markExecution() and AbstractTask::unmarkExecution()
+atomic by modifying (UPDATE) the value of the "serialized_executions"
+field only if it's still set to the update base value previously
+SELECT-ed. That allows parallel invocations of
+AbstractTask::markExecution() to no longer obtain the same execution id
+and fixes a bug in AbstractTask::unmarkExecution() that reverted
+removals of execution ids.
 
-A full reproduction is available online:
+Adjust AbstractTask::markExecution() to no longer
+hallucinate a non-existing execution id of 0 in situations were the
+persistence record associated with the task cannot be SELECT-ed from the
+database.
+
+Change AbstractTask::unmarkExecution() to no longer override the
+previous value of the tasks record "lastexecution_failure" field if the
+given `$failureReason` method argument is `null`. This is due to the
+change described in the first paragraph, where we need to remove the
+execution of a task when it wasn't executed. The previous as well as the
+updated implementation of Scheduler::executeTask() always pass in a
+value of type `string` if the task execution happened.
+
+A full reproduction is available online on GitHub:
 https://github.com/adamkoppede/typo3-parallel-scheduler-task-processing-test
 
 Change-Id: I1264b5c248dd9aa5402383a498d82650932f29e4
+Resolves: #106318
+Releases: 11.5
 ---
- Classes/Scheduler.php  |  55 +++++----
- .../scheduler/Classes/Task/AbstractTask.php   | 114 +++++++++++-------
- 2 files changed, 104 insertions(+), 65 deletions(-)
+ typo3/sysext/scheduler/Classes/Scheduler.php  |  49 ++++---
+ .../scheduler/Classes/Task/AbstractTask.php   | 134 +++++++++++-------
+ 2 files changed, 110 insertions(+), 73 deletions(-)
 
 diff --git a/Classes/Scheduler.php b/Classes/Scheduler.php
-index 24bfde3500f..f2d56455fb2 100644
+index 24bfde3500f..9747add94ec 100644
 --- a/Classes/Scheduler.php
 +++ b/Classes/Scheduler.php
-@@ -186,28 +186,41 @@ class Scheduler implements SingletonInterface
+@@ -169,34 +169,37 @@ class Scheduler implements SingletonInterface
+         // Set a scheduler object for the task again,
+         // as it was removed during the save operation
+         $task->setScheduler();
+-        $result = true;
+-        // Task is already running and multiple executions are not allowed
+-        if (!$task->areMultipleExecutionsAllowed() && $task->isExecutionRunning()) {
++
++        // Reserve an id for the upcoming execution
++        $executionID = $task->markExecution();
++
++        // Make sure we're the only one executing this single-execution-only task
++        if (!$task->areMultipleExecutionsAllowed() && $executionID > 0) {
++            $task->unmarkExecution($executionID, false);
+             // Log multiple execution error
+             $this->logger->info('Task is already running and multiple executions are not allowed, skipping! Class: {class}, UID: {uid}', [
+                 'class' => get_class($task),
+                 'uid' => $task->getTaskUid(),
              ]);
-             // Register execution
-             $executionID = $task->markExecution();
+-            $result = false;
+-        } else {
+-            // Log scheduler invocation
+-            $this->logger->info('Start execution. Class: {class}, UID: {uid}', [
+-                'class' => get_class($task),
+-                'uid' => $task->getTaskUid(),
+-            ]);
+-            // Register execution
+-            $executionID = $task->markExecution();
 -            $failure = null;
 -            try {
 -                // Execute task
 -                $successfullyExecuted = $task->execute();
 -                if (!$successfullyExecuted) {
 -                    throw new FailedExecutionException('Task failed to execute successfully. Class: ' . get_class($task) . ', UID: ' . $task->getTaskUid(), 1250596541);
-+            if (!$task->areMultipleExecutionsAllowed() && $executionID > 0) {
-+                // The first execution id of an idle task is always 0.
-+                // A non zero execution id means that another execution of this
-+                // task started between the $task->isExecutionRunning() check
-+                // and the execution registration in $task->markExecution().
-+                $task->unmarkExecution($executionID, null);
-+                $this->logger->info('Task is already running and multiple executions are not allowed, skipping! Class: {class}, UID: {uid}', [
-+                    'class' => get_class($task),
-+                    'uid' => $task->getTaskUid(),
-+                ]);
-+                $result = false;
-+            } else {
-+                $failure = null;
-+                try {
-+                    // Execute task
-+                    $successfullyExecuted = $task->execute();
-+                    if (!$successfullyExecuted) {
-+                        throw new FailedExecutionException('Task failed to execute successfully. Class: ' . get_class($task) . ', UID: ' . $task->getTaskUid(), 1250596541);
-+                    }
-+                } catch (\Throwable $e) {
-+                    // Store exception, so that it can be saved to database
-+                    $failure = $e;
-+                }
-+                // Un-register execution
-+                $task->unmarkExecution($executionID, $failure);
-+                // Log completion of execution
-+                $this->logger->info('Task executed. Class: {class}, UID: {uid}', [
-+                    'class' => get_class($task),
-+                    'uid' => $task->getTaskUid(),
-+                ]);
-+                // Now that the result of the task execution has been handled,
-+                // throw the exception again, if any
-+                if ($failure instanceof \Throwable) {
-+                    throw $failure;
-                 }
+-                }
 -            } catch (\Throwable $e) {
 -                // Store exception, so that it can be saved to database
 -                $failure = $e;
--            }
--            // Un-register execution
--            $task->unmarkExecution($executionID, $failure);
--            // Log completion of execution
--            $this->logger->info('Task executed. Class: {class}, UID: {uid}', [
--                'class' => get_class($task),
--                'uid' => $task->getTaskUid(),
--            ]);
--            // Now that the result of the task execution has been handled,
--            // throw the exception again, if any
--            if ($failure instanceof \Throwable) {
--                throw $failure;
++            return false;
++        }
++
++        // Log scheduler invocation
++        $this->logger->info('Start execution. Class: {class}, UID: {uid}', [
++            'class' => get_class($task),
++            'uid' => $task->getTaskUid(),
++        ]);
++
++        $failure = null;
++        try {
++            // Execute task
++            $successfullyExecuted = $task->execute();
++            if (!$successfullyExecuted) {
++                throw new FailedExecutionException('Task failed to execute successfully. Class: ' . get_class($task) . ', UID: ' . $task->getTaskUid(), 1250596541);
              }
++        } catch (\Throwable $e) {
++            $failure = $e;
++        } finally {
+             // Un-register execution
+             $task->unmarkExecution($executionID, $failure);
+             // Log completion of execution
+@@ -209,8 +212,8 @@ class Scheduler implements SingletonInterface
+             if ($failure instanceof \Throwable) {
+                 throw $failure;
+             }
++            return true;
          }
-         return $result;
+-        return $result;
+     }
+ 
+     /**
 diff --git a/Classes/Task/AbstractTask.php b/Classes/Task/AbstractTask.php
-index d7e3bd3d950..add9408a059 100644
+index d7e3bd3d950..25c0a09a5f7 100644
 --- a/Classes/Task/AbstractTask.php
 +++ b/Classes/Task/AbstractTask.php
-@@ -428,41 +428,55 @@ abstract class AbstractTask implements LoggerAwareInterface
+@@ -421,6 +421,9 @@ abstract class AbstractTask implements LoggerAwareInterface
+      * This method adds current execution to the execution list
+      * It also logs the execution time and mode
+      *
++     * The execution id is guaranteed to start from zero if the task has no
++     * currently running execution at the time of id allocation.
++     *
+      * @return int Execution id
+      */
+     public function markExecution()
+@@ -428,66 +431,86 @@ abstract class AbstractTask implements LoggerAwareInterface
          $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)
              ->getQueryBuilderForTable('tx_scheduler_task');
  
@@ -124,7 +152,9 @@ index d7e3bd3d950..add9408a059 100644
 +                ->executeQuery()
 +                ->fetchAssociative();
 +
-+            $checkedValue = (string)($row['serialized_executions'] ?? '');
++            $checkedValue = isset($row['serialized_executions'])
++                ? (string)$row['serialized_executions']
++                : null;
 +
 +            $runningExecutions = [];
 +            if ($row && !empty($row['serialized_executions'])) {
@@ -191,7 +221,16 @@ index d7e3bd3d950..add9408a059 100644
      }
  
      /**
-@@ -477,17 +491,21 @@ abstract class AbstractTask implements LoggerAwareInterface
+      * Removes given execution from list
+      *
+      * @param int $executionID Id of the execution to remove.
+-     * @param \Throwable $e An exception to signal a failed execution
++     * @param \Throwable|false|null $e An exception to signal a failed execution
+      */
+-    public function unmarkExecution($executionID, ?\Throwable $e = null)
++    public function unmarkExecution($executionID, $e = null)
+     {
+         // Get the executions for the task
          $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)
              ->getQueryBuilderForTable('tx_scheduler_task');
  
@@ -223,17 +262,27 @@ index d7e3bd3d950..add9408a059 100644
              // Remove the selected execution
              unset($runningExecutions[$executionID]);
              if (!empty($runningExecutions)) {
-@@ -515,7 +533,7 @@ abstract class AbstractTask implements LoggerAwareInterface
+@@ -514,22 +537,33 @@ abstract class AbstractTask implements LoggerAwareInterface
+             } else {
                  $failureString = '';
              }
++            $fieldUpdates = [
++                'serialized_executions' => $runningExecutionsSerialized,
++            ];
++            if ($e !== false) {
++                $fieldUpdates['lastexecution_failure'] = $failureString;
++            }
              // Save the updated executions list
 -            GeneralUtility::makeInstance(ConnectionPool::class)
 +            $updateCount = GeneralUtility::makeInstance(ConnectionPool::class)
                  ->getConnectionForTable('tx_scheduler_task')
                  ->update(
                      'tx_scheduler_task',
-@@ -525,11 +543,19 @@ abstract class AbstractTask implements LoggerAwareInterface
-                     ],
+-                    [
+-                        'serialized_executions' => $runningExecutionsSerialized,
+-                        'lastexecution_failure' => $failureString,
+-                    ],
++                    $fieldUpdates,
                      [
                          'uid' => $this->taskUid,
 +                        'serialized_executions' => $previousValue,

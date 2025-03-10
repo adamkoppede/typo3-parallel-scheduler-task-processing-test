@@ -1,48 +1,53 @@
-From 781e66aed6b2008d696320e7af1b476fe5f9f615 Mon Sep 17 00:00:00 2001
+From 97867e0968d679f0f371e4d451513513897bddab Mon Sep 17 00:00:00 2001
 From: Adam Koppe <adam.koppe@3m5.de>
 Date: Thu, 6 Mar 2025 12:05:21 +0100
-Subject: [PATCH] [BUGFIX] parallel execution of non-parallel scheduler task
+Subject: [PATCH] [BUGFIX] Parallel execution of non-parallel scheduler task
 
-Previously, multiple scheduler invocations may have picked up the same
-non-parallel scheduler task at the same time. This was due to a
-Time-of-Check Time-of-Use style issue in Scheduler::executeTask(): The
-check preventing parallel executions of non-parallel tasks occurred
-long before the execution was registered. If multiple parallel
-Scheduler::executeTask() calls hit that time window, they all continued
-to actually execute the non-parallel task. This issue is fixed by
-checking the task execution id after the allocation. This way the
-database guarantees that only a single process is able to get a certain
-execution id value since it is a zero-based counter.
+Close a Time-of-Check Time-of-Use style time window in
+Scheduler::executeTask() by checking the actual task execution id value
+after the allocation instead of checking for any task execution id
+allocations long before the actual execution id allocation happens. The
+time window allowed multiple scheduler invocations to pick up and
+execute the same non-parallel scheduler task at the same time.
 
-Removing the toctou window requires fixing another issue in
-SchedulerTaskRepository::{add,remove}ExecutionToTask(): The future
-tx_scheduler_task.serialized_executions field value was built upon some
-past value. If two processes ran one of these methods in parallel with
-such timing that the time window between the SELECT and UPDATE sql
-statements overlapped, only one operation succeeded. This issue is fixed
-by restricting UPDATE to only be applied if the new value was built upon
-the latest serialized_executions value.
+Make SchedulerTaskRepository::addExecutionToTask() and
+SchedulerTaskRepository::removeExecutionOfTask() atomic by modifying
+(UPDATE) the value of the "serialized_executions" field only if it's
+still set to the update base value previously SELECT-ed. That allows
+parallel invocations of SchedulerTaskRepository::addExecutionToTask() to
+no longer obtain the same execution id and fixes a bug in
+SchedulerTaskRepository::removeExecutionOfTask() that reverted
+removals of execution ids.
 
-This change also adjusts SchedulerTaskrepository::addExecutionToTask()
-to no longer hallucinate a non-existing execution id of 0 if the
-persistence record associated with the task cannot be found in the
-database by requiring that the persistence record exists for the given
-task.
+Adjust SchedulerTaskRepository::addExecutionToTask() to no longer
+hallucinate a non-existing execution id of 0 in situations were the
+persistence record associated with the task cannot be SELECT-ed from the
+database.
 
-A full reproduction is available online:
+Change SchedulerTaskRepository::removeExecutionOfTask() to no longer
+override the previous value of the tasks record "lastexecution_failure"
+field if the given `$failureReason` method argument is `null`. This is
+due to the change described in the first paragraph, where we need to
+remove the execution of a task when it wasn't executed. The previous as
+well as the updated implementation of Scheduler::executeTask() always
+pass in a value of type `string` if the task execution happened.
+
+A full reproduction is available online on GitHub:
 https://github.com/adamkoppede/typo3-parallel-scheduler-task-processing-test
 
 Change-Id: I1264b5c248dd9aa5402383a498d82650932f29e4
+Resolves: #106318
+Releases: main, 13.4, 12.4
 ---
- .../Repository/SchedulerTaskRepository.php    | 103 ++++++++++++------
- Classes/Scheduler.php  |  93 ++++++++--------
- 2 files changed, 114 insertions(+), 82 deletions(-)
+ .../Repository/SchedulerTaskRepository.php    | 106 ++++++++++++------
+ typo3/sysext/scheduler/Classes/Scheduler.php  |  93 ++++++++-------
+ 2 files changed, 117 insertions(+), 82 deletions(-)
 
 diff --git a/Classes/Domain/Repository/SchedulerTaskRepository.php b/Classes/Domain/Repository/SchedulerTaskRepository.php
-index 6ed8d03ee3a..e0f934885e7 100644
+index 6ed8d03ee3a..55b0d76f27c 100644
 --- a/Classes/Domain/Repository/SchedulerTaskRepository.php
 +++ b/Classes/Domain/Repository/SchedulerTaskRepository.php
-@@ -452,51 +452,75 @@ class SchedulerTaskRepository
+@@ -452,51 +452,78 @@ class SchedulerTaskRepository
       * This method adds current execution to the execution list.
       * It also logs the execution time and mode
       *
@@ -67,11 +72,14 @@ index 6ed8d03ee3a..e0f934885e7 100644
 +                );
 +            }
 +
-+            $previousExecutions = (string)($row['serialized_executions'] ?? '');
++            $previousExecutions = isset($row['serialized_executions'])
++                ? (string)$row['serialized_executions']
++                : null;
 +
-+            $runningExecutions = $previousExecutions !== ''
-+                ? unserialize($previousExecutions)
-+                : [];
++            $runningExecutions = $previousExecutions !== null
++                && $previousExecutions !== ''
++                    ? unserialize($previousExecutions)
++                    : [];
 +
 +            // Count the number of existing executions and use that number as a key
 +            // (we need to know that number, because it is returned at the end of the method)
@@ -148,7 +156,7 @@ index 6ed8d03ee3a..e0f934885e7 100644
              // Remove the selected execution
              unset($runningExecutions[$executionID]);
              if (!empty($runningExecutions)) {
-@@ -509,21 +533,30 @@ class SchedulerTaskRepository
+@@ -509,21 +536,30 @@ class SchedulerTaskRepository
                  $failureReason = json_encode($failureReason);
              }
              // Save the updated executions list
@@ -185,7 +193,7 @@ index 6ed8d03ee3a..e0f934885e7 100644
      }
  
 diff --git a/Classes/Scheduler.php b/Classes/Scheduler.php
-index eb9245ed54b..2f5abe28596 100644
+index eb9245ed54b..8087182f3fc 100644
 --- a/Classes/Scheduler.php
 +++ b/Classes/Scheduler.php
 @@ -143,52 +143,57 @@ class Scheduler implements SingletonInterface
@@ -260,7 +268,7 @@ index eb9245ed54b..2f5abe28596 100644
 +                throw new FailedExecutionException('Task failed to execute successfully. Class: ' . get_class($task) . ', UID: ' . $task->getTaskUid(), 1250596541);
              }
 +            return true;
-+        } catch(\Throwable $e) {
++        } catch (\Throwable $e) {
 +            // Log failed execution
 +            $this->logger->error('Task failed to execute successfully. Class: {taskClass}, UID: {taskId}, Code: {code}, "{message}" in {exceptionFile} at line {exceptionLine}', [
 +                'taskClass' => get_class($task),
